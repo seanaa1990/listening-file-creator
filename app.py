@@ -3,7 +3,7 @@ import edge_tts
 import asyncio
 import tempfile
 import os
-from pydub import AudioSegment
+import subprocess
 import re
 
 st.set_page_config(page_title="Listening File Creator", page_icon="🎧", layout="centered")
@@ -26,6 +26,42 @@ async def generate_clip(text, voice, rate_pct, pitch_hz, out_path):
     pitch_str = f"{pitch_hz:+d}Hz"
     communicate = edge_tts.Communicate(text, voice, rate=rate_str, pitch=pitch_str)
     await communicate.save(out_path)
+
+def stitch_clips_ffmpeg(clip_paths, pause_ms, output_path):
+    """Stitch MP3 clips together with silence gaps using ffmpeg directly."""
+    tmp_dir = tempfile.mkdtemp()
+    
+    # Build a list of all segments including silence files
+    all_segments = []
+    silence_path = os.path.join(tmp_dir, "silence.mp3")
+    
+    # Generate a silence file
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi",
+        "-i", f"anullsrc=r=24000:cl=mono",
+        "-t", str(pause_ms / 1000),
+        "-q:a", "9", "-acodec", "libmp3lame",
+        silence_path
+    ], capture_output=True)
+
+    for i, clip in enumerate(clip_paths):
+        all_segments.append(clip)
+        if i < len(clip_paths) - 1:
+            all_segments.append(silence_path)
+
+    # Write concat list file
+    list_path = os.path.join(tmp_dir, "list.txt")
+    with open(list_path, "w") as f:
+        for seg in all_segments:
+            f.write(f"file '{seg}'\n")
+
+    # Concatenate
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_path,
+        "-acodec", "libmp3lame", "-q:a", "4",
+        output_path
+    ], capture_output=True)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.header("Settings")
@@ -75,7 +111,6 @@ else:
                                placeholder="A: Good morning!\nB: Hi, how are you?\nA: I'm fine thanks...",
                                height=280)
 
-    # Live parse preview
     if text_input.strip():
         lines = [l.strip() for l in text_input.strip().splitlines() if l.strip()]
         parsed_preview = []
@@ -116,10 +151,8 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
                 st.success("Done!")
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
-                st.info("Make sure edge-tts is installed: `pip install edge-tts`")
 
     else:
-        # Dialogue mode
         lines = [l.strip() for l in text_input.strip().splitlines() if l.strip()]
         parsed = []
         for line in lines:
@@ -148,20 +181,15 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
                             text=f"Line {i+1} of {len(parsed)}..."
                         )
 
-                    # Stitch with pauses
-                    silence = AudioSegment.silent(duration=pause_ms)
-                    combined = AudioSegment.empty()
-                    for i, path in enumerate(tmp_files):
-                        clip = AudioSegment.from_mp3(path)
-                        combined += clip
-                        if i < len(tmp_files) - 1:
-                            combined += silence
-                        os.unlink(path)
-
-                    # Export final MP3
+                    # Stitch with ffmpeg
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as out:
                         out_path = out.name
-                    combined.export(out_path, format="mp3")
+                    stitch_clips_ffmpeg(tmp_files, pause_ms, out_path)
+
+                    for f in tmp_files:
+                        try: os.unlink(f)
+                        except: pass
+
                     with open(out_path, "rb") as f:
                         audio_bytes = f.read()
                     os.unlink(out_path)
@@ -174,7 +202,6 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
                     )
                     st.success(f"Done! {len(parsed)}-line dialogue generated.")
 
-                    # Transcript
                     with st.expander("📄 View transcript"):
                         for speaker, text in parsed:
                             name_a = voice_a_label.split("(")[1].split(")")[0]
@@ -184,13 +211,6 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
 
                 except Exception as e:
                     st.error(f"Something went wrong: {e}")
-                    st.info(
-                        "Make sure pydub and ffmpeg are installed:\n\n"
-                        "`pip install pydub`\n\n"
-                        "Then install ffmpeg:\n"
-                        "- **Windows:** https://ffmpeg.org/download.html\n"
-                        "- **Mac:** `brew install ffmpeg`"
-                    )
 
 st.divider()
 st.caption("Built with Streamlit + Microsoft Edge TTS · Single voice & dialogue modes")
