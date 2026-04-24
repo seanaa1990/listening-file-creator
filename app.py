@@ -11,14 +11,33 @@ st.set_page_config(page_title="Listening File Creator", page_icon="🎧", layout
 st.title("🎧 Listening File Creator")
 
 VOICES = {
+    # British
     "🇬🇧 British Female (Sonia) — clear, neutral": "en-GB-SoniaNeural",
+    "🇬🇧 British Female (Maisie) — younger sound": "en-GB-MaisieNeural",
     "🇬🇧 British Male (Ryan) — warm, natural": "en-GB-RyanNeural",
+    # American
     "🇺🇸 American Female (Jenny) — friendly": "en-US-JennyNeural",
     "🇺🇸 American Male (Guy) — clear": "en-US-GuyNeural",
+    "🇺🇸 American Male (Davis)": "en-US-DavisNeural",
+    "🇺🇸 American Male (Tony)": "en-US-TonyNeural",
+    # Australian
     "🇦🇺 Australian Female (Natasha)": "en-AU-NatashaNeural",
     "🇦🇺 Australian Male (William)": "en-AU-WilliamNeural",
+    # Irish
+    "🇮🇪 Irish Female (Emily)": "en-IE-EmilyNeural",
+    "🇮🇪 Irish Male (Connor)": "en-IE-ConnorNeural",
+    # New Zealand
+    "🇳🇿 New Zealand Female (Molly)": "en-NZ-MollyNeural",
+    "🇳🇿 New Zealand Male (Mitchell)": "en-NZ-MitchellNeural",
+    # Canadian
     "🇨🇦 Canadian Female (Clara)": "en-CA-ClaraNeural",
+    # Singapore
+    "🇸🇬 Singapore Female (Luna)": "en-SG-LunaNeural",
+    # South African
+    "🇿🇦 South African Female (Leah)": "en-ZA-LeahNeural",
+    # Indian
     "🇮🇳 Indian Female (Neerja)": "en-IN-NeerjaNeural",
+    "🇮🇳 Indian Male (Prabhat)": "en-IN-PrabhatNeural",
 }
 
 async def generate_clip(text, voice, rate_pct, pitch_hz, out_path):
@@ -28,14 +47,9 @@ async def generate_clip(text, voice, rate_pct, pitch_hz, out_path):
     await communicate.save(out_path)
 
 def stitch_clips_ffmpeg(clip_paths, pause_ms, output_path):
-    """Stitch MP3 clips together with silence gaps using ffmpeg directly."""
     tmp_dir = tempfile.mkdtemp()
-    
-    # Build a list of all segments including silence files
-    all_segments = []
     silence_path = os.path.join(tmp_dir, "silence.mp3")
-    
-    # Generate a silence file
+
     subprocess.run([
         "ffmpeg", "-y", "-f", "lavfi",
         "-i", f"anullsrc=r=24000:cl=mono",
@@ -44,18 +58,17 @@ def stitch_clips_ffmpeg(clip_paths, pause_ms, output_path):
         silence_path
     ], capture_output=True)
 
+    all_segments = []
     for i, clip in enumerate(clip_paths):
         all_segments.append(clip)
         if i < len(clip_paths) - 1:
             all_segments.append(silence_path)
 
-    # Write concat list file
     list_path = os.path.join(tmp_dir, "list.txt")
     with open(list_path, "w") as f:
         for seg in all_segments:
             f.write(f"file '{seg}'\n")
 
-    # Concatenate
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
         "-i", list_path,
@@ -68,9 +81,11 @@ st.sidebar.header("Settings")
 mode = st.sidebar.radio("Mode", ["Single Voice", "Dialogue (A & B)"])
 filename = st.sidebar.text_input("Output filename", value="listening-activity-1")
 
+voice_list = list(VOICES.keys())
+
 if mode == "Single Voice":
     st.sidebar.subheader("Voice")
-    voice_label = st.sidebar.selectbox("Voice", list(VOICES.keys()))
+    voice_label = st.sidebar.selectbox("Voice", voice_list)
     voice_id = VOICES[voice_label]
     rate = st.sidebar.slider("Speed (%)", 50, 120, 90, 5,
                               help="100 = normal. 75–90 recommended for EFL.")
@@ -78,13 +93,13 @@ if mode == "Single Voice":
 
 else:
     st.sidebar.subheader("Speaker A")
-    voice_a_label = st.sidebar.selectbox("Voice A", list(VOICES.keys()), index=0)
+    voice_a_label = st.sidebar.selectbox("Voice A", voice_list, index=0)
     voice_a = VOICES[voice_a_label]
     rate_a = st.sidebar.slider("Speed A (%)", 50, 120, 90, 5)
     pitch_a = st.sidebar.slider("Pitch A (Hz)", -10, 10, 0, 1)
 
     st.sidebar.subheader("Speaker B")
-    voice_b_label = st.sidebar.selectbox("Voice B", list(VOICES.keys()), index=1)
+    voice_b_label = st.sidebar.selectbox("Voice B", voice_list, index=2)
     voice_b = VOICES[voice_b_label]
     rate_b = st.sidebar.slider("Speed B (%)", 50, 120, 90, 5)
     pitch_b = st.sidebar.slider("Pitch B (Hz)", -10, 10, 0, 1)
@@ -181,7 +196,6 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
                             text=f"Line {i+1} of {len(parsed)}..."
                         )
 
-                    # Stitch with ffmpeg
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as out:
                         out_path = out.name
                     stitch_clips_ffmpeg(tmp_files, pause_ms, out_path)
