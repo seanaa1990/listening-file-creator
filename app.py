@@ -5,6 +5,8 @@ import tempfile
 import os
 import subprocess
 import re
+import struct
+import math
 
 st.set_page_config(page_title="Listening File Creator", page_icon="🎧", layout="centered")
 
@@ -18,26 +20,23 @@ VOICES = {
     # American
     "🇺🇸 American Female (Jenny) — friendly": "en-US-JennyNeural",
     "🇺🇸 American Male (Guy) — clear": "en-US-GuyNeural",
-    "🇺🇸 American Male (Davis)": "en-US-DavisNeural",
-    "🇺🇸 American Male (Tony)": "en-US-TonyNeural",
     # Australian
     "🇦🇺 Australian Female (Natasha)": "en-AU-NatashaNeural",
     "🇦🇺 Australian Male (William)": "en-AU-WilliamNeural",
-    # Irish
-    "🇮🇪 Irish Female (Emily)": "en-IE-EmilyNeural",
-    "🇮🇪 Irish Male (Connor)": "en-IE-ConnorNeural",
-    # New Zealand
-    "🇳🇿 New Zealand Female (Molly)": "en-NZ-MollyNeural",
-    "🇳🇿 New Zealand Male (Mitchell)": "en-NZ-MitchellNeural",
     # Canadian
     "🇨🇦 Canadian Female (Clara)": "en-CA-ClaraNeural",
     # Singapore
     "🇸🇬 Singapore Female (Luna)": "en-SG-LunaNeural",
-    # South African
-    "🇿🇦 South African Female (Leah)": "en-ZA-LeahNeural",
     # Indian
     "🇮🇳 Indian Female (Neerja)": "en-IN-NeerjaNeural",
     "🇮🇳 Indian Male (Prabhat)": "en-IN-PrabhatNeural",
+}
+
+ANNOUNCEMENT_VOICES = {
+    "🇬🇧 British Female (Sonia)": "en-GB-SoniaNeural",
+    "🇬🇧 British Male (Ryan)": "en-GB-RyanNeural",
+    "🇺🇸 American Female (Jenny)": "en-US-JennyNeural",
+    "🇺🇸 American Male (Guy)": "en-US-GuyNeural",
 }
 
 async def generate_clip(text, voice, rate_pct, pitch_hz, out_path):
@@ -46,17 +45,51 @@ async def generate_clip(text, voice, rate_pct, pitch_hz, out_path):
     communicate = edge_tts.Communicate(text, voice, rate=rate_str, pitch=pitch_str)
     await communicate.save(out_path)
 
+def generate_beep_wav(out_path, frequency=880, duration_ms=400, sample_rate=24000):
+    """Generate a simple sine wave beep as a WAV file."""
+    num_samples = int(sample_rate * duration_ms / 1000)
+    amplitude = 16000
+
+    with open(out_path, 'wb') as f:
+        # WAV header
+        data_size = num_samples * 2
+        f.write(b'RIFF')
+        f.write(struct.pack('<I', 36 + data_size))
+        f.write(b'WAVE')
+        f.write(b'fmt ')
+        f.write(struct.pack('<I', 16))           # chunk size
+        f.write(struct.pack('<H', 1))            # PCM
+        f.write(struct.pack('<H', 1))            # mono
+        f.write(struct.pack('<I', sample_rate))
+        f.write(struct.pack('<I', sample_rate * 2))
+        f.write(struct.pack('<H', 2))            # block align
+        f.write(struct.pack('<H', 16))           # bits per sample
+        f.write(b'data')
+        f.write(struct.pack('<I', data_size))
+
+        # Fade in/out over 10ms to avoid clicks
+        fade_samples = int(sample_rate * 0.01)
+        for i in range(num_samples):
+            sample = amplitude * math.sin(2 * math.pi * frequency * i / sample_rate)
+            if i < fade_samples:
+                sample *= i / fade_samples
+            elif i > num_samples - fade_samples:
+                sample *= (num_samples - i) / fade_samples
+            f.write(struct.pack('<h', int(sample)))
+
+def generate_silence_mp3(out_path, duration_ms):
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi",
+        "-i", "anullsrc=r=24000:cl=mono",
+        "-t", str(duration_ms / 1000),
+        "-q:a", "9", "-acodec", "libmp3lame",
+        out_path
+    ], capture_output=True)
+
 def stitch_clips_ffmpeg(clip_paths, pause_ms, output_path):
     tmp_dir = tempfile.mkdtemp()
     silence_path = os.path.join(tmp_dir, "silence.mp3")
-
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "lavfi",
-        "-i", f"anullsrc=r=24000:cl=mono",
-        "-t", str(pause_ms / 1000),
-        "-q:a", "9", "-acodec", "libmp3lame",
-        silence_path
-    ], capture_output=True)
+    generate_silence_mp3(silence_path, pause_ms)
 
     all_segments = []
     for i, clip in enumerate(clip_paths):
@@ -110,6 +143,25 @@ else:
         help="Gap between each speaker's line. 500–800ms feels natural."
     )
 
+# ── Intro settings ────────────────────────────────────────────────────────────
+st.sidebar.subheader("Intro")
+use_announcement = st.sidebar.checkbox("Add announcement", value=True)
+announcement_voice_label = st.sidebar.selectbox(
+    "Announcement voice", list(ANNOUNCEMENT_VOICES.keys()),
+    disabled=not use_announcement
+)
+announcement_text = st.sidebar.text_area(
+    "Announcement text",
+    value="You are going to hear a recording. Listen carefully.",
+    height=80,
+    disabled=not use_announcement
+)
+use_beep = st.sidebar.checkbox("Add beep after announcement", value=True)
+pause_after_intro_ms = st.sidebar.slider(
+    "Pause after intro (ms)", 500, 4000, 1500, 500,
+    help="Gap between the intro and the main audio."
+)
+
 # ── Main area ─────────────────────────────────────────────────────────────────
 if mode == "Single Voice":
     st.write("Paste your listening passage below and generate a single-voice MP3.")
@@ -144,6 +196,41 @@ else:
             st.warning(e)
 
 # ── Generate ──────────────────────────────────────────────────────────────────
+def build_intro_segments(tmp_dir):
+    """Returns list of mp3 file paths for the intro sequence."""
+    segments = []
+
+    if use_announcement and announcement_text.strip():
+        ann_path = os.path.join(tmp_dir, "announcement.mp3")
+        asyncio.run(generate_clip(
+            announcement_text.strip(),
+            ANNOUNCEMENT_VOICES[announcement_voice_label],
+            90, 0, ann_path
+        ))
+        segments.append(ann_path)
+
+        # Short pause after announcement
+        ann_pause_path = os.path.join(tmp_dir, "ann_pause.mp3")
+        generate_silence_mp3(ann_pause_path, 600)
+        segments.append(ann_pause_path)
+
+    if use_beep:
+        beep_wav = os.path.join(tmp_dir, "beep.wav")
+        beep_mp3 = os.path.join(tmp_dir, "beep.mp3")
+        generate_beep_wav(beep_wav)
+        subprocess.run([
+            "ffmpeg", "-y", "-i", beep_wav,
+            "-acodec", "libmp3lame", "-q:a", "4", beep_mp3
+        ], capture_output=True)
+        segments.append(beep_mp3)
+
+    if segments:
+        pause_path = os.path.join(tmp_dir, "intro_pause.mp3")
+        generate_silence_mp3(pause_path, pause_after_intro_ms)
+        segments.append(pause_path)
+
+    return segments
+
 if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
     if not text_input.strip():
         st.warning("Please enter some text first.")
@@ -151,12 +238,30 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
     elif mode == "Single Voice":
         with st.spinner("Generating audio..."):
             try:
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                    tmp_path = tmp.name
-                asyncio.run(generate_clip(text_input.strip(), voice_id, rate, pitch, tmp_path))
-                with open(tmp_path, "rb") as f:
+                tmp_dir = tempfile.mkdtemp()
+                all_segments = build_intro_segments(tmp_dir)
+
+                main_path = os.path.join(tmp_dir, "main.mp3")
+                asyncio.run(generate_clip(text_input.strip(), voice_id, rate, pitch, main_path))
+                all_segments.append(main_path)
+
+                out_path = os.path.join(tmp_dir, "output.mp3")
+                if len(all_segments) == 1:
+                    out_path = all_segments[0]
+                else:
+                    list_path = os.path.join(tmp_dir, "list.txt")
+                    with open(list_path, "w") as f:
+                        for seg in all_segments:
+                            f.write(f"file '{seg}'\n")
+                    subprocess.run([
+                        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                        "-i", list_path,
+                        "-acodec", "libmp3lame", "-q:a", "4", out_path
+                    ], capture_output=True)
+
+                with open(out_path, "rb") as f:
                     audio_bytes = f.read()
-                os.unlink(tmp_path)
+
                 st.audio(audio_bytes, format="audio/mp3")
                 st.download_button(
                     "⬇ Download MP3", data=audio_bytes,
@@ -180,33 +285,46 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
         else:
             with st.spinner(f"Generating {len(parsed)} lines of dialogue..."):
                 try:
-                    tmp_files = []
+                    tmp_dir = tempfile.mkdtemp()
+                    all_segments = build_intro_segments(tmp_dir)
+
                     progress = st.progress(0, text="Generating voices...")
+                    dialogue_clips = []
 
                     for i, (speaker, text) in enumerate(parsed):
-                        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                            tmp_path = tmp.name
+                        clip_path = os.path.join(tmp_dir, f"line_{i}.mp3")
                         v = voice_a if speaker == "A" else voice_b
                         r = rate_a  if speaker == "A" else rate_b
                         p = pitch_a if speaker == "A" else pitch_b
-                        asyncio.run(generate_clip(text, v, r, p, tmp_path))
-                        tmp_files.append(tmp_path)
+                        asyncio.run(generate_clip(text, v, r, p, clip_path))
+                        dialogue_clips.append(clip_path)
                         progress.progress(
                             (i + 1) / len(parsed),
                             text=f"Line {i+1} of {len(parsed)}..."
                         )
 
-                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as out:
-                        out_path = out.name
-                    stitch_clips_ffmpeg(tmp_files, pause_ms, out_path)
+                    # Interleave dialogue clips with silence
+                    silence_path = os.path.join(tmp_dir, "silence.mp3")
+                    generate_silence_mp3(silence_path, pause_ms)
+                    for i, clip in enumerate(dialogue_clips):
+                        all_segments.append(clip)
+                        if i < len(dialogue_clips) - 1:
+                            all_segments.append(silence_path)
 
-                    for f in tmp_files:
-                        try: os.unlink(f)
-                        except: pass
+                    # Final stitch
+                    out_path = os.path.join(tmp_dir, "output.mp3")
+                    list_path = os.path.join(tmp_dir, "list.txt")
+                    with open(list_path, "w") as f:
+                        for seg in all_segments:
+                            f.write(f"file '{seg}'\n")
+                    subprocess.run([
+                        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                        "-i", list_path,
+                        "-acodec", "libmp3lame", "-q:a", "4", out_path
+                    ], capture_output=True)
 
                     with open(out_path, "rb") as f:
                         audio_bytes = f.read()
-                    os.unlink(out_path)
 
                     st.audio(audio_bytes, format="audio/mp3")
                     st.download_button(
@@ -217,6 +335,9 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
                     st.success(f"Done! {len(parsed)}-line dialogue generated.")
 
                     with st.expander("📄 View transcript"):
+                        if use_announcement and announcement_text.strip():
+                            st.markdown(f"*📢 {announcement_text.strip()}*")
+                            st.markdown("---")
                         for speaker, text in parsed:
                             name_a = voice_a_label.split("(")[1].split(")")[0]
                             name_b = voice_b_label.split("(")[1].split(")")[0]
