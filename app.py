@@ -13,21 +13,15 @@ st.set_page_config(page_title="Listening File Creator", page_icon="🎧", layout
 st.title("🎧 Listening File Creator")
 
 VOICES = {
-    # British
     "🇬🇧 British Female (Sonia) — clear, neutral": "en-GB-SoniaNeural",
     "🇬🇧 British Female (Maisie) — younger sound": "en-GB-MaisieNeural",
     "🇬🇧 British Male (Ryan) — warm, natural": "en-GB-RyanNeural",
-    # American
     "🇺🇸 American Female (Jenny) — friendly": "en-US-JennyNeural",
     "🇺🇸 American Male (Guy) — clear": "en-US-GuyNeural",
-    # Australian
     "🇦🇺 Australian Female (Natasha)": "en-AU-NatashaNeural",
     "🇦🇺 Australian Male (William)": "en-AU-WilliamNeural",
-    # Canadian
     "🇨🇦 Canadian Female (Clara)": "en-CA-ClaraNeural",
-    # Singapore
     "🇸🇬 Singapore Female (Luna)": "en-SG-LunaNeural",
-    # Indian
     "🇮🇳 Indian Female (Neerja)": "en-IN-NeerjaNeural",
     "🇮🇳 Indian Male (Prabhat)": "en-IN-PrabhatNeural",
 }
@@ -39,8 +33,8 @@ ANNOUNCEMENT_VOICES = {
     "🇺🇸 American Male (Guy)": "en-US-GuyNeural",
 }
 
-# Default voices assigned to each speaker letter (cycles through if more speakers)
 DEFAULT_VOICE_INDICES = [0, 2, 3, 4, 5, 6]
+voice_list = list(VOICES.keys())
 
 async def generate_clip(text, voice, rate_pct, pitch_hz, out_path):
     rate_str = f"{rate_pct - 100:+d}%"
@@ -96,12 +90,10 @@ def stitch_clips(all_segments, out_path):
     ], capture_output=True)
     os.unlink(tmp_list)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Sidebar: core settings ────────────────────────────────────────────────────
 st.sidebar.header("Settings")
 mode = st.sidebar.radio("Mode", ["Single Voice", "Dialogue"])
 filename = st.sidebar.text_input("Output filename", value="listening-activity-1")
-
-voice_list = list(VOICES.keys())
 
 if mode == "Single Voice":
     st.sidebar.subheader("Voice")
@@ -113,10 +105,8 @@ if mode == "Single Voice":
 
 else:
     st.sidebar.subheader("Dialogue Timing")
-    pause_ms = st.sidebar.slider(
-        "Pause between turns (ms)", 200, 2000, 600, 100,
-        help="Gap between each speaker's line. 500–800ms feels natural."
-    )
+    pause_ms = st.sidebar.slider("Pause between turns (ms)", 200, 2000, 600, 100,
+                                  help="500–800ms feels natural.")
     rate_global = st.sidebar.slider("Speed — all speakers (%)", 50, 120, 90, 5)
     pitch_global = st.sidebar.slider("Pitch — all speakers (Hz)", -10, 10, 0, 1)
 
@@ -147,6 +137,8 @@ if mode == "Single Voice":
                                height=240)
     word_count = len(text_input.split()) if text_input.strip() else 0
     st.caption(f"{word_count} words · {len(text_input)} characters")
+    detected_speakers = []
+    speaker_voices = {}
 
 else:
     st.write("Write your dialogue below. Tag each line with a speaker letter: `A:`, `B:`, `C:`, etc.")
@@ -158,52 +150,50 @@ else:
         height=280
     )
 
-    # --- Detect speakers and show voice pickers ---
+    # Detect speakers from current text
     detected_speakers = []
-    if text_input.strip():
-        for line in text_input.strip().splitlines():
-            m = re.match(r'^([A-Z])\s*:\s*', line.strip())
-            if m and m.group(1) not in detected_speakers:
-                detected_speakers.append(m.group(1))
-        detected_speakers.sort()
+    for line in text_input.strip().splitlines():
+        m = re.match(r'^([A-Z])\s*:\s*', line.strip())
+        if m and m.group(1) not in detected_speakers:
+            detected_speakers.append(m.group(1))
+    detected_speakers.sort()
 
-    speaker_voices = {}
+    # Line count preview
     if detected_speakers:
-        st.markdown(f"**Detected speakers: {' · '.join(detected_speakers)}**")
-        cols = st.columns(min(len(detected_speakers), 3))
-        for i, spk in enumerate(detected_speakers):
-            default_idx = DEFAULT_VOICE_INDICES[i % len(DEFAULT_VOICE_INDICES)]
-            with cols[i % len(cols)]:
-                label = st.selectbox(
-                    f"Speaker {spk}",
-                    voice_list,
-                    index=default_idx,
-                    key=f"voice_{spk}"
-                )
-                speaker_voices[spk] = VOICES[label]
-
-        # Line count preview
         lines = [l.strip() for l in text_input.strip().splitlines() if l.strip()]
         parsed_preview = []
-        errors = []
-        for i, line in enumerate(lines, 1):
+        for line in lines:
             m = re.match(r'^([A-Z])\s*:\s*(.+)', line)
             if m:
                 parsed_preview.append((m.group(1), m.group(2).strip()))
-            else:
-                errors.append(f"Line {i} skipped (no speaker tag): `{line}`")
-
         if parsed_preview:
             counts = {}
             for spk, _ in parsed_preview:
                 counts[spk] = counts.get(spk, 0) + 1
             summary = " · ".join(f"{spk}: {n} lines" for spk, n in sorted(counts.items()))
             st.caption(f"{len(parsed_preview)} lines parsed — {summary}")
-        for e in errors:
-            st.warning(e)
+    elif text_input.strip():
+        st.info("No speaker tags found. Start lines with A:, B:, C: etc.")
+
+    # ── Speaker voice selectors — always in sidebar so values persist ──
+    speaker_voices = {}
+    if detected_speakers:
+        st.sidebar.subheader("Speaker Voices")
+        for i, spk in enumerate(detected_speakers):
+            default_idx = DEFAULT_VOICE_INDICES[i % len(DEFAULT_VOICE_INDICES)]
+            label = st.sidebar.selectbox(
+                f"Speaker {spk}",
+                voice_list,
+                index=default_idx,
+                key=f"voice_{spk}"
+            )
+            speaker_voices[spk] = VOICES[label]
     else:
-        if text_input.strip():
-            st.info("No speaker tags found. Start lines with A:, B:, C: etc.")
+        # Still need to read any previously set sidebar widgets so state is consistent
+        for spk in "ABCDEF":
+            key = f"voice_{spk}"
+            if key in st.session_state:
+                speaker_voices[spk] = VOICES[st.session_state[key]]
 
 # ── Intro builder ─────────────────────────────────────────────────────────────
 def build_intro_segments(tmp_dir):
@@ -270,6 +260,8 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
     else:  # Dialogue mode
         if not detected_speakers:
             st.warning("No speaker tags found. Start lines with A:, B:, C: etc.")
+        elif not speaker_voices:
+            st.warning("Speaker voices not set. Please add your script first so voices appear in the sidebar.")
         else:
             lines = [l.strip() for l in text_input.strip().splitlines() if l.strip()]
             parsed = []
