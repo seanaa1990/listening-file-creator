@@ -1,2 +1,2 @@
-streamlit
-edge-tts
+streamlit==1.63.0
+edge-tts==7.2.8
