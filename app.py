@@ -26,30 +26,35 @@ st.set_page_config(page_title="Listening File Creator", page_icon="🎧", layout
 st.title("🎧 Listening File Creator")
 
 VOICES = {
+    # ── 🇬🇧 United Kingdom ──
     "🇬🇧 British Female (Sonia) — clear, neutral": "en-GB-SoniaNeural",
     "🇬🇧 British Female (Maisie) — younger sound": "en-GB-MaisieNeural",
-    "🇬🇧 British Male (Ryan) — warm, natural": "en-GB-RyanNeural",
-    "🇺🇸 American Female (Jenny) — friendly": "en-US-JennyNeural",
-    "🇺🇸 American Male (Guy) — clear": "en-US-GuyNeural",
-    "🇦🇺 Australian Female (Natasha)": "en-AU-NatashaNeural",
-    "🇦🇺 Australian Male (William)": "en-AU-WilliamMultilingualNeural",
-    "🇨🇦 Canadian Female (Clara)": "en-CA-ClaraNeural",
-    "🇸🇬 Singapore Female (Luna)": "en-SG-LunaNeural",
-    "🇮🇳 Indian Female (Neerja)": "en-IN-NeerjaNeural",
-    "🇮🇳 Indian Male (Prabhat)": "en-IN-PrabhatNeural",
-    # ── added: fuller UK/US range ──
     "🇬🇧 British Female (Libby)": "en-GB-LibbyNeural",
+    "🇬🇧 British Male (Ryan) — warm, natural": "en-GB-RyanNeural",
+    # ── 🇺🇸 United States ──
+    "🇺🇸 American Female (Jenny) — friendly": "en-US-JennyNeural",
     "🇺🇸 American Female (Aria) — confident": "en-US-AriaNeural",
     "🇺🇸 American Female (Ava) — expressive, warm": "en-US-AvaMultilingualNeural",
     "🇺🇸 American Female (Emma) — cheerful, clear": "en-US-EmmaMultilingualNeural",
     "🇺🇸 American Female (Michelle) — pleasant": "en-US-MichelleNeural",
+    "🇺🇸 American Male (Guy) — clear": "en-US-GuyNeural",
     "🇺🇸 American Male (Andrew) — warm, confident": "en-US-AndrewMultilingualNeural",
     "🇺🇸 American Male (Brian) — casual, approachable": "en-US-BrianMultilingualNeural",
     "🇺🇸 American Male (Christopher) — authoritative": "en-US-ChristopherNeural",
     "🇺🇸 American Male (Eric) — measured": "en-US-EricNeural",
     "🇺🇸 American Male (Roger) — lively": "en-US-RogerNeural",
     "🇺🇸 American Male (Steffan) — steady, formal": "en-US-SteffanNeural",
-    # ── added: African Englishes ──
+    # ── 🇦🇺 Australia ──
+    "🇦🇺 Australian Female (Natasha)": "en-AU-NatashaNeural",
+    "🇦🇺 Australian Male (William)": "en-AU-WilliamMultilingualNeural",
+    # ── 🇨🇦 Canada ──
+    "🇨🇦 Canadian Female (Clara)": "en-CA-ClaraNeural",
+    # ── 🇮🇳 India ──
+    "🇮🇳 Indian Female (Neerja)": "en-IN-NeerjaNeural",
+    "🇮🇳 Indian Male (Prabhat)": "en-IN-PrabhatNeural",
+    # ── 🇸🇬 Singapore ──
+    "🇸🇬 Singapore Female (Luna)": "en-SG-LunaNeural",
+    # ── 🌍 African Englishes ──
     "🇰🇪 Kenyan Female (Asilia)": "en-KE-AsiliaNeural",
     "🇰🇪 Kenyan Male (Chilemba)": "en-KE-ChilembaNeural",
     "🇳🇬 Nigerian Female (Ezinne)": "en-NG-EzinneNeural",
@@ -67,8 +72,18 @@ ANNOUNCEMENT_VOICES = {
     "🇺🇸 American Male (Guy)": "en-US-GuyNeural",
 }
 
-DEFAULT_VOICE_INDICES = [0, 2, 3, 4, 5, 6]
+# Keyed by voice id rather than list position, so reordering VOICES above
+# can never silently reassign a speaker's default voice.
+DEFAULT_SPEAKER_VOICES = [
+    "en-GB-SoniaNeural",
+    "en-GB-RyanNeural",
+    "en-US-JennyNeural",
+    "en-US-GuyNeural",
+    "en-AU-NatashaNeural",
+    "en-AU-WilliamMultilingualNeural",
+]
 voice_list = list(VOICES.keys())
+_voice_ids = list(VOICES.values())
 
 async def generate_clip(text, voice, rate_pct, pitch_hz, out_path):
     rate_str = f"{rate_pct - 100:+d}%"
@@ -224,7 +239,8 @@ else:
     if detected_speakers:
         st.sidebar.subheader("Speaker Voices")
         for i, spk in enumerate(detected_speakers):
-            default_idx = DEFAULT_VOICE_INDICES[i % len(DEFAULT_VOICE_INDICES)]
+            default_id = DEFAULT_SPEAKER_VOICES[i % len(DEFAULT_SPEAKER_VOICES)]
+            default_idx = _voice_ids.index(default_id)
             label = st.sidebar.selectbox(
                 f"Speaker {spk}",
                 voice_list,
