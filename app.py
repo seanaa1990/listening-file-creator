@@ -91,6 +91,31 @@ async def generate_clip(text, voice, rate_pct, pitch_hz, out_path):
     communicate = edge_tts.Communicate(text, voice, rate=rate_str, pitch=pitch_str)
     await communicate.save(out_path)
 
+
+# Cap on simultaneous requests to the TTS endpoint. Unbounded fan-out on a long
+# script risks being rate limited, which is slower than just queueing.
+MAX_PARALLEL_CLIPS = 5
+
+
+async def _generate_all(jobs, on_progress=None):
+    """Synthesize (text, voice, rate, pitch, out_path) jobs concurrently."""
+    sem = asyncio.Semaphore(MAX_PARALLEL_CLIPS)
+    done = 0
+
+    async def one(job):
+        nonlocal done
+        async with sem:
+            await generate_clip(*job)
+        done += 1
+        if on_progress:
+            on_progress(done)
+
+    await asyncio.gather(*(one(j) for j in jobs))
+
+
+def generate_clips(jobs, on_progress=None):
+    asyncio.run(_generate_all(jobs, on_progress))
+
 def generate_beep_wav(out_path, frequency=880, duration_ms=400, sample_rate=24000):
     num_samples = int(sample_rate * duration_ms / 1000)
     amplitude = 16000
@@ -126,28 +151,71 @@ def _require_ffmpeg():
         )
 
 
-def generate_silence_mp3(out_path, duration_ms):
+def run_ffmpeg(args, doing):
+    """Run ffmpeg and raise with its own error text if it fails.
+
+    Output is captured, so without this check a failed run would leave a
+    missing or truncated file that the caller would happily read as audio.
+    """
     _require_ffmpeg()
-    subprocess.run([
-        FFMPEG, "-y", "-f", "lavfi",
+    r = subprocess.run([FFMPEG, "-y", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        tail = " / ".join((r.stderr or "").strip().splitlines()[-3:])
+        raise RuntimeError(f"ffmpeg failed while {doing}: {tail or 'no error output'}")
+
+
+def generate_silence_mp3(out_path, duration_ms):
+    run_ffmpeg([
+        "-f", "lavfi",
         "-i", "anullsrc=r=24000:cl=mono",
         "-t", str(duration_ms / 1000),
         "-q:a", "9", "-acodec", "libmp3lame",
         out_path
-    ], capture_output=True)
+    ], "creating a pause")
+
 
 def stitch_clips(all_segments, out_path):
     _require_ffmpeg()
-    tmp_list = tempfile.mktemp(suffix=".txt")
-    with open(tmp_list, "w") as f:
-        for seg in all_segments:
-            f.write(f"file '{seg}'\n")
-    subprocess.run([
-        FFMPEG, "-y", "-f", "concat", "-safe", "0",
-        "-i", tmp_list,
-        "-acodec", "libmp3lame", "-q:a", "4", out_path
-    ], capture_output=True)
-    os.unlink(tmp_list)
+    fd, tmp_list = tempfile.mkstemp(suffix=".txt", dir=os.path.dirname(out_path) or None)
+    try:
+        with os.fdopen(fd, "w") as f:
+            for seg in all_segments:
+                f.write(f"file '{seg}'\n")
+        run_ffmpeg([
+            "-f", "concat", "-safe", "0",
+            "-i", tmp_list,
+            "-acodec", "libmp3lame", "-q:a", "4", out_path
+        ], "joining the audio segments")
+    finally:
+        try:
+            os.unlink(tmp_list)
+        except OSError:
+            pass
+
+PREVIEW_TEXT = "The train to the city centre leaves at half past nine."
+
+
+def voice_preview(voice_id, key):
+    """A one-line sample of a voice, so picking between 30 of them is quick."""
+    state_key = f"_preview_{key}"
+    if st.sidebar.button("🔊 Preview voice", key=f"_prevbtn_{key}",
+                         use_container_width=True):
+        d = tempfile.mkdtemp(prefix="lfc_prev_")
+        try:
+            path = os.path.join(d, "preview.mp3")
+            generate_clips([(PREVIEW_TEXT, voice_id, 90, 0, path)])
+            with open(path, "rb") as f:
+                st.session_state[state_key] = (voice_id, f.read())
+        except Exception as e:
+            st.sidebar.error(f"Preview failed: {e}")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    cached = st.session_state.get(state_key)
+    # Drop the player if the selection moved on, so it can't play the wrong voice
+    if cached and cached[0] == voice_id:
+        st.sidebar.audio(cached[1], format="audio/mp3")
+
 
 # ── Sidebar: core settings ────────────────────────────────────────────────────
 st.sidebar.header("Settings")
@@ -158,6 +226,7 @@ if mode == "Single Voice":
     st.sidebar.subheader("Voice")
     voice_label = st.sidebar.selectbox("Voice", voice_list)
     voice_id = VOICES[voice_label]
+    voice_preview(voice_id, "single")
     rate = st.sidebar.slider("Speed (%)", 50, 120, 90, 5,
                               help="100 = normal. 75–90 recommended for EFL.")
     pitch = st.sidebar.slider("Pitch (Hz)", -10, 10, 0, 1)
@@ -176,6 +245,8 @@ announcement_voice_label = st.sidebar.selectbox(
     "Announcement voice", list(ANNOUNCEMENT_VOICES.keys()),
     disabled=not use_announcement
 )
+if use_announcement:
+    voice_preview(ANNOUNCEMENT_VOICES[announcement_voice_label], "announcement")
 announcement_text = st.sidebar.text_area(
     "Announcement text",
     value="You are going to hear a recording. Listen carefully.",
@@ -248,6 +319,7 @@ else:
                 key=f"voice_{spk}"
             )
             speaker_voices[spk] = VOICES[label]
+            voice_preview(speaker_voices[spk], f"spk_{spk}")
     else:
         # Still need to read any previously set sidebar widgets so state is consistent
         for spk in "ABCDEF":
@@ -274,10 +346,10 @@ def build_intro_segments(tmp_dir):
         beep_wav = os.path.join(tmp_dir, "beep.wav")
         beep_mp3 = os.path.join(tmp_dir, "beep.mp3")
         generate_beep_wav(beep_wav)
-        subprocess.run([
-            FFMPEG, "-y", "-i", beep_wav,
+        run_ffmpeg([
+            "-i", beep_wav,
             "-acodec", "libmp3lame", "-q:a", "4", beep_mp3
-        ], capture_output=True)
+        ], "encoding the beep")
         segments.append(beep_mp3)
 
     if segments:
@@ -294,8 +366,8 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
 
     elif mode == "Single Voice":
         with st.spinner("Generating audio..."):
+            tmp_dir = tempfile.mkdtemp(prefix="lfc_")
             try:
-                tmp_dir = tempfile.mkdtemp()
                 all_segments = build_intro_segments(tmp_dir)
                 main_path = os.path.join(tmp_dir, "main.mp3")
                 asyncio.run(generate_clip(text_input.strip(), voice_id, rate, pitch, main_path))
@@ -316,6 +388,8 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
                 st.success("Done!")
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     else:  # Dialogue mode
         if not detected_speakers:
@@ -334,29 +408,24 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
                 st.warning("No valid tagged lines found. Check your format.")
             else:
                 with st.spinner(f"Generating {len(parsed)} lines of dialogue..."):
+                    tmp_dir = tempfile.mkdtemp(prefix="lfc_")
                     try:
-                        tmp_dir = tempfile.mkdtemp()
                         all_segments = build_intro_segments(tmp_dir)
                         silence_path = os.path.join(tmp_dir, "silence.mp3")
                         generate_silence_mp3(silence_path, pause_ms)
 
                         progress = st.progress(0, text="Generating voices...")
-                        dialogue_clips = []
-
-                        for i, (spk, text) in enumerate(parsed):
-                            clip_path = os.path.join(tmp_dir, f"line_{i}.mp3")
-                            asyncio.run(generate_clip(
-                                text,
-                                speaker_voices[spk],
-                                rate_global,
-                                pitch_global,
-                                clip_path
-                            ))
-                            dialogue_clips.append(clip_path)
-                            progress.progress(
-                                (i + 1) / len(parsed),
-                                text=f"Line {i+1} of {len(parsed)}..."
-                            )
+                        dialogue_clips = [
+                            os.path.join(tmp_dir, f"line_{i}.mp3")
+                            for i in range(len(parsed))
+                        ]
+                        jobs = [
+                            (text, speaker_voices[spk], rate_global, pitch_global, path)
+                            for (spk, text), path in zip(parsed, dialogue_clips)
+                        ]
+                        generate_clips(jobs, on_progress=lambda n: progress.progress(
+                            n / len(jobs), text=f"{n} of {len(jobs)} lines..."
+                        ))
 
                         for i, clip in enumerate(dialogue_clips):
                             all_segments.append(clip)
@@ -388,6 +457,8 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
 
                     except Exception as e:
                         st.error(f"Something went wrong: {e}")
+                    finally:
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 st.divider()
 st.caption("Built with Streamlit + Microsoft Edge TTS · Single voice & multi-speaker dialogue")
