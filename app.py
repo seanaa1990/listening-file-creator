@@ -32,11 +32,32 @@ VOICES = {
     "🇺🇸 American Female (Jenny) — friendly": "en-US-JennyNeural",
     "🇺🇸 American Male (Guy) — clear": "en-US-GuyNeural",
     "🇦🇺 Australian Female (Natasha)": "en-AU-NatashaNeural",
-    "🇦🇺 Australian Male (William)": "en-AU-WilliamNeural",
+    "🇦🇺 Australian Male (William)": "en-AU-WilliamMultilingualNeural",
     "🇨🇦 Canadian Female (Clara)": "en-CA-ClaraNeural",
     "🇸🇬 Singapore Female (Luna)": "en-SG-LunaNeural",
     "🇮🇳 Indian Female (Neerja)": "en-IN-NeerjaNeural",
     "🇮🇳 Indian Male (Prabhat)": "en-IN-PrabhatNeural",
+    # ── added: fuller UK/US range ──
+    "🇬🇧 British Female (Libby)": "en-GB-LibbyNeural",
+    "🇺🇸 American Female (Aria) — confident": "en-US-AriaNeural",
+    "🇺🇸 American Female (Ava) — expressive, warm": "en-US-AvaMultilingualNeural",
+    "🇺🇸 American Female (Emma) — cheerful, clear": "en-US-EmmaMultilingualNeural",
+    "🇺🇸 American Female (Michelle) — pleasant": "en-US-MichelleNeural",
+    "🇺🇸 American Male (Andrew) — warm, confident": "en-US-AndrewMultilingualNeural",
+    "🇺🇸 American Male (Brian) — casual, approachable": "en-US-BrianMultilingualNeural",
+    "🇺🇸 American Male (Christopher) — authoritative": "en-US-ChristopherNeural",
+    "🇺🇸 American Male (Eric) — measured": "en-US-EricNeural",
+    "🇺🇸 American Male (Roger) — lively": "en-US-RogerNeural",
+    "🇺🇸 American Male (Steffan) — steady, formal": "en-US-SteffanNeural",
+    # ── added: African Englishes ──
+    "🇰🇪 Kenyan Female (Asilia)": "en-KE-AsiliaNeural",
+    "🇰🇪 Kenyan Male (Chilemba)": "en-KE-ChilembaNeural",
+    "🇳🇬 Nigerian Female (Ezinne)": "en-NG-EzinneNeural",
+    "🇳🇬 Nigerian Male (Abeo)": "en-NG-AbeoNeural",
+    "🇹🇿 Tanzanian Female (Imani)": "en-TZ-ImaniNeural",
+    "🇹🇿 Tanzanian Male (Elimu)": "en-TZ-ElimuNeural",
+    "🇿🇦 South African Female (Leah)": "en-ZA-LeahNeural",
+    "🇿🇦 South African Male (Luke)": "en-ZA-LukeNeural",
 }
 
 ANNOUNCEMENT_VOICES = {
