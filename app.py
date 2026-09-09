@@ -7,6 +7,19 @@ import subprocess
 import re
 import struct
 import math
+import shutil
+
+
+def _resolve_ffmpeg():
+    """Prefer the pip-installed static binary; fall back to a system ffmpeg."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+FFMPEG = _resolve_ffmpeg()
 
 st.set_page_config(page_title="Listening File Creator", page_icon="🎧", layout="centered")
 
@@ -69,9 +82,18 @@ def generate_beep_wav(out_path, frequency=880, duration_ms=400, sample_rate=2400
                 sample *= (num_samples - i) / fade_samples
             f.write(struct.pack('<h', int(sample)))
 
+def _require_ffmpeg():
+    if not FFMPEG:
+        raise RuntimeError(
+            "ffmpeg is not available, so audio segments can't be joined. "
+            "Single Voice mode still works."
+        )
+
+
 def generate_silence_mp3(out_path, duration_ms):
+    _require_ffmpeg()
     subprocess.run([
-        "ffmpeg", "-y", "-f", "lavfi",
+        FFMPEG, "-y", "-f", "lavfi",
         "-i", "anullsrc=r=24000:cl=mono",
         "-t", str(duration_ms / 1000),
         "-q:a", "9", "-acodec", "libmp3lame",
@@ -79,12 +101,13 @@ def generate_silence_mp3(out_path, duration_ms):
     ], capture_output=True)
 
 def stitch_clips(all_segments, out_path):
+    _require_ffmpeg()
     tmp_list = tempfile.mktemp(suffix=".txt")
     with open(tmp_list, "w") as f:
         for seg in all_segments:
             f.write(f"file '{seg}'\n")
     subprocess.run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        FFMPEG, "-y", "-f", "concat", "-safe", "0",
         "-i", tmp_list,
         "-acodec", "libmp3lame", "-q:a", "4", out_path
     ], capture_output=True)
@@ -215,7 +238,7 @@ def build_intro_segments(tmp_dir):
         beep_mp3 = os.path.join(tmp_dir, "beep.mp3")
         generate_beep_wav(beep_wav)
         subprocess.run([
-            "ffmpeg", "-y", "-i", beep_wav,
+            FFMPEG, "-y", "-i", beep_wav,
             "-acodec", "libmp3lame", "-q:a", "4", beep_mp3
         ], capture_output=True)
         segments.append(beep_mp3)
