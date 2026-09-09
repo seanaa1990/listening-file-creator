@@ -192,6 +192,54 @@ def stitch_clips(all_segments, out_path):
         except OSError:
             pass
 
+# ── Pause markers ─────────────────────────────────────────────────────────────
+# A trailing "[3s]" (or "[2.5s]") on a line sets the pause that follows it,
+# overriding the global gap. Scripts with no markers behave exactly as before.
+PAUSE_MARKER = re.compile(r'\[\s*(\d+(?:\.\d+)?)\s*s\s*\]\s*$', re.IGNORECASE)
+
+
+def strip_pause_marker(text):
+    """Return (text without a trailing [Ns] marker, that pause in ms or None)."""
+    m = PAUSE_MARKER.search(text)
+    if not m:
+        return text.strip(), None
+    return PAUSE_MARKER.sub("", text).strip(), int(float(m.group(1)) * 1000)
+
+
+def split_passage(text):
+    """Split a single-voice passage into (chunk, pause_after_ms) pairs.
+
+    With no markers this returns one chunk and no pause — i.e. the single-clip
+    behaviour the app had before markers existed.
+    """
+    chunks, buf = [], []
+    for line in text.strip().splitlines():
+        body, pause = strip_pause_marker(line)
+        if body:
+            buf.append(body)
+        if pause is not None and buf:
+            chunks.append(("\n".join(buf), pause))
+            buf = []
+    if buf:
+        chunks.append(("\n".join(buf), None))
+    return chunks
+
+
+def silence_cache(tmp_dir):
+    """Silence clips are reused across a build, so each duration is made once."""
+    made = {}
+
+    def get(ms):
+        ms = int(ms)
+        if ms not in made:
+            path = os.path.join(tmp_dir, f"silence_{ms}.mp3")
+            generate_silence_mp3(path, ms)
+            made[ms] = path
+        return made[ms]
+
+    return get
+
+
 PREVIEW_TEXT = "The train to the city centre leaves at half past nine."
 
 
@@ -259,9 +307,26 @@ pause_after_intro_ms = st.sidebar.slider(
     help="Gap between the intro and the main audio."
 )
 
+# ── Playback ──────────────────────────────────────────────────────────────────
+st.sidebar.subheader("Playback")
+play_twice = st.sidebar.checkbox(
+    "Play passage twice", value=False,
+    help="Exam format: the whole passage again after a gap."
+)
+repeat_gap_ms = st.sidebar.slider(
+    "Gap before second play (ms)", 1000, 10000, 3000, 500,
+    disabled=not play_twice
+)
+repeat_lead_in = st.sidebar.text_input(
+    "Lead-in to second play", value="Now listen again.",
+    disabled=not play_twice,
+    help="Spoken in the announcement voice. Leave blank for a silent gap."
+)
+
 # ── Main area ─────────────────────────────────────────────────────────────────
 if mode == "Single Voice":
     st.write("Paste your listening passage below and generate a single-voice MP3.")
+    st.caption("Pause control: end any line with `[3s]` to put a 3-second gap after it — handy for dictation and gap-fill.")
     text_input = st.text_area("Your text",
                                placeholder="Paste your listening passage here...",
                                height=240)
@@ -272,7 +337,8 @@ if mode == "Single Voice":
 
 else:
     st.write("Write your dialogue below. Tag each line with a speaker letter: `A:`, `B:`, `C:`, etc.")
-    st.code("A: Good morning everyone.\nB: Hello! Nice to meet you.\nC: Hi! Are we starting now?\nA: Yes, let's begin.", language=None)
+    st.code("A: Good morning everyone.\nB: Hello! Nice to meet you. [3s]\nC: Hi! Are we starting now?\nA: Yes, let's begin.", language=None)
+    st.caption("Pause control: end any line with `[3s]` to put a 3-second gap after it — handy for dictation and gap-fill.")
 
     text_input = st.text_area(
         "Your dialogue",
@@ -359,6 +425,22 @@ def build_intro_segments(tmp_dir):
 
     return segments
 
+
+def build_repeat_segments(tmp_dir, body_segments, get_silence):
+    """Gap, optional spoken lead-in, then the whole passage again."""
+    segs = [get_silence(repeat_gap_ms)]
+    if repeat_lead_in.strip():
+        lead_path = os.path.join(tmp_dir, "repeat_lead_in.mp3")
+        generate_clips([(
+            repeat_lead_in.strip(),
+            ANNOUNCEMENT_VOICES[announcement_voice_label],
+            90, 0, lead_path
+        )])
+        segs.append(lead_path)
+        segs.append(get_silence(1000))
+    segs.extend(body_segments)
+    return segs
+
 # ── Generate ──────────────────────────────────────────────────────────────────
 if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
     if not text_input.strip():
@@ -368,10 +450,27 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
         with st.spinner("Generating audio..."):
             tmp_dir = tempfile.mkdtemp(prefix="lfc_")
             try:
+                get_silence = silence_cache(tmp_dir)
                 all_segments = build_intro_segments(tmp_dir)
-                main_path = os.path.join(tmp_dir, "main.mp3")
-                asyncio.run(generate_clip(text_input.strip(), voice_id, rate, pitch, main_path))
-                all_segments.append(main_path)
+
+                chunks = split_passage(text_input)
+                jobs, body = [], []
+                for i, (chunk, pause) in enumerate(chunks):
+                    part_path = os.path.join(tmp_dir, f"part_{i}.mp3")
+                    jobs.append((chunk, voice_id, rate, pitch, part_path))
+                    body.append(part_path)
+                    if pause:
+                        body.append(get_silence(pause))
+
+                progress = st.progress(0, text="Generating audio...")
+                generate_clips(jobs, on_progress=lambda n: progress.progress(
+                    n / len(jobs), text=f"{n} of {len(jobs)} parts..."
+                ))
+
+                all_segments.extend(body)
+                if play_twice:
+                    all_segments.extend(build_repeat_segments(tmp_dir, body, get_silence))
+
                 out_path = os.path.join(tmp_dir, "output.mp3")
                 if len(all_segments) == 1:
                     out_path = all_segments[0]
@@ -402,7 +501,9 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
             for line in lines:
                 m = re.match(r'^([A-Z])\s*:\s*(.+)', line)
                 if m and m.group(1) in speaker_voices:
-                    parsed.append((m.group(1), m.group(2).strip()))
+                    body_text, pause_override = strip_pause_marker(m.group(2))
+                    if body_text:
+                        parsed.append((m.group(1), body_text, pause_override))
 
             if not parsed:
                 st.warning("No valid tagged lines found. Check your format.")
@@ -410,9 +511,8 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
                 with st.spinner(f"Generating {len(parsed)} lines of dialogue..."):
                     tmp_dir = tempfile.mkdtemp(prefix="lfc_")
                     try:
+                        get_silence = silence_cache(tmp_dir)
                         all_segments = build_intro_segments(tmp_dir)
-                        silence_path = os.path.join(tmp_dir, "silence.mp3")
-                        generate_silence_mp3(silence_path, pause_ms)
 
                         progress = st.progress(0, text="Generating voices...")
                         dialogue_clips = [
@@ -421,16 +521,23 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
                         ]
                         jobs = [
                             (text, speaker_voices[spk], rate_global, pitch_global, path)
-                            for (spk, text), path in zip(parsed, dialogue_clips)
+                            for (spk, text, _), path in zip(parsed, dialogue_clips)
                         ]
                         generate_clips(jobs, on_progress=lambda n: progress.progress(
                             n / len(jobs), text=f"{n} of {len(jobs)} lines..."
                         ))
 
+                        body = []
                         for i, clip in enumerate(dialogue_clips):
-                            all_segments.append(clip)
+                            body.append(clip)
                             if i < len(dialogue_clips) - 1:
-                                all_segments.append(silence_path)
+                                override = parsed[i][2]
+                                body.append(get_silence(override or pause_ms))
+                        all_segments.extend(body)
+                        if play_twice:
+                            all_segments.extend(
+                                build_repeat_segments(tmp_dir, body, get_silence)
+                            )
 
                         out_path = os.path.join(tmp_dir, "output.mp3")
                         stitch_clips(all_segments, out_path)
@@ -450,7 +557,7 @@ if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
                             if use_announcement and announcement_text.strip():
                                 st.markdown(f"*📢 {announcement_text.strip()}*")
                                 st.markdown("---")
-                            for spk, text in parsed:
+                            for spk, text, _ in parsed:
                                 voice_name = [k for k, v in VOICES.items() if v == speaker_voices[spk]]
                                 name = voice_name[0].split("(")[1].split(")")[0] if voice_name else spk
                                 st.markdown(f"**{spk} — {name}:** {text}")
