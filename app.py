@@ -296,37 +296,190 @@ def stitch_clips(all_segments, out_path):
         except OSError:
             pass
 
+
 # ── Pause markers ─────────────────────────────────────────────────────────────
-# A trailing "[3s]" (or "[2.5s]") on a line sets the pause that follows it,
-# overriding the global gap. Scripts with no markers behave exactly as before.
-PAUSE_MARKER = re.compile(r'\[\s*(\d+(?:\.\d+)?)\s*s\s*\]\s*$', re.IGNORECASE)
+# "[3s]" (or "[2.5s]") anywhere in a line inserts a pause at that point. At the
+# end of a dialogue line it replaces the normal gap between turns. Scripts with
+# no markers behave exactly as before.
+PAUSE_MARKER = re.compile(r'\[\s*(\d+(?:\.\d+)?)\s*s\s*\]', re.IGNORECASE)
+_LEADING_PUNCT = " ,;:"
 
 
-def strip_pause_marker(text):
-    """Return (text without a trailing [Ns] marker, that pause in ms or None)."""
-    m = PAUSE_MARKER.search(text)
-    if not m:
-        return text.strip(), None
-    return PAUSE_MARKER.sub("", text).strip(), int(float(m.group(1)) * 1000)
+def parse_inline_pauses(text):
+    """Split text on [Ns] markers into (chunk, pause_after_ms) pairs.
+
+    A chunk can be "" when the text starts with a marker (pause before speech).
+    Text with no markers comes back as a single (text, 0) pair.
+    """
+    parts, last = [], 0
+    for m in PAUSE_MARKER.finditer(text):
+        chunk = text[last:m.start()].strip().lstrip(_LEADING_PUNCT).strip()
+        ms = int(float(m.group(1)) * 1000)
+        if chunk or not parts:
+            parts.append((chunk, ms))
+        else:  # back-to-back markers: merge the pauses
+            parts[-1] = (parts[-1][0], parts[-1][1] + ms)
+        last = m.end()
+    rest = text[last:].strip().lstrip(_LEADING_PUNCT).strip()
+    if rest:
+        parts.append((rest, 0))
+    return parts
+
+
+def strip_pause_markers(text):
+    return re.sub(r"[ \t]{2,}", " ", PAUSE_MARKER.sub(" ", text)).strip()
 
 
 def split_passage(text):
-    """Split a single-voice passage into (chunk, pause_after_ms) pairs.
+    """Single-voice passage -> (chunk, pause_after_ms) pairs.
 
-    With no markers this returns one chunk and no pause — i.e. the single-clip
-    behaviour the app had before markers existed.
+    Unmarked lines are joined into one chunk, so a passage with no markers is
+    still synthesised as a single clip with natural prosody.
     """
     chunks, buf = [], []
-    for line in text.strip().splitlines():
-        body, pause = strip_pause_marker(line)
-        if body:
-            buf.append(body)
-        if pause is not None and buf:
+
+    def flush(pause):
+        if buf:
             chunks.append(("\n".join(buf), pause))
-            buf = []
-    if buf:
-        chunks.append(("\n".join(buf), None))
+            buf.clear()
+        elif pause:
+            chunks.append(("", pause))
+
+    for line in text.strip().splitlines():
+        for chunk, pause in parse_inline_pauses(line):
+            if chunk:
+                buf.append(chunk)
+            if pause:
+                flush(pause)
+    flush(0)
     return chunks
+
+
+_ABBREVIATIONS = {"mr.", "mrs.", "ms.", "dr.", "prof.", "st.", "e.g.", "i.e.",
+                  "etc.", "vs.", "no.", "approx."}
+
+
+def split_sentences(text):
+    """Dictation units: each line, further split into sentences."""
+    sentences = []
+    for line in text.strip().splitlines():
+        line = strip_pause_markers(line)
+        if not line:
+            continue
+        for s in re.split(r'(?<=[.!?])\s+(?=["\'(A-Z0-9])', line):
+            s = s.strip()
+            if not s:
+                continue
+            # "Mr. Smith" must not be split into two dictation sentences
+            if sentences and sentences[-1].split()[-1].lower() in _ABBREVIATIONS:
+                sentences[-1] += " " + s
+            else:
+                sentences.append(s)
+    return sentences
+
+
+# ── Speakers ──────────────────────────────────────────────────────────────────
+# Any short name works as a tag: "A:", "Emma:", "Dr. Patel:", "Shop Assistant:".
+SPEAKER_LINE = re.compile(r"^\s*([A-Za-z][\w .'\-()]{0,24}?)\s*:\s*(.*)$")
+_NOT_SPEAKERS = {"http", "https", "note", "notes", "ps", "answer", "answers"}
+MAX_NAME_WORDS = 3
+
+
+def parse_dialogue(text):
+    """Return (speakers in order of appearance, [(speaker, chunks), ...]).
+
+    Untagged lines continue the previous speaker's turn.
+    """
+    speakers, canonical, lines = [], {}, []
+    for raw in text.strip().splitlines():
+        if not raw.strip():
+            continue
+        m = SPEAKER_LINE.match(raw)
+        name = " ".join(m.group(1).split()) if m else ""
+        if m and name.lower() in _NOT_SPEAKERS:
+            continue  # "Note: ..." or a URL — never read aloud
+        is_tag = m and len(name.split()) <= MAX_NAME_WORDS
+        if is_tag:
+            name = canonical.setdefault(name.lower(), name)  # "doctor" == "Doctor"
+            chunks = parse_inline_pauses(m.group(2))
+            if not chunks:
+                continue
+            if name not in speakers:
+                speakers.append(name)
+            lines.append((name, chunks))
+        elif lines:
+            chunks = parse_inline_pauses(raw)
+            prev = lines[-1][1]
+            if chunks and prev[-1][0] and prev[-1][1] == 0 and chunks[0][0]:
+                prev[-1] = (prev[-1][0] + " " + chunks[0][0], chunks[0][1])
+                chunks = chunks[1:]
+            prev.extend(chunks)
+    return speakers, lines
+
+
+def safe_key(name):
+    return re.sub(r"\W+", "_", name.lower()).strip("_") or "spk"
+
+
+# ── Effects & ambience ────────────────────────────────────────────────────────
+AUDIO_EFFECTS = {
+    "None": None,
+    "📞 Telephone": "highpass=f=300,lowpass=f=3400,volume=1.3",
+    "📻 Radio / PA speaker": "highpass=f=400,lowpass=f=4000,volume=1.2",
+    "🏛️ Large room / hall": "aecho=0.8:0.88:40:0.3",
+}
+
+# (noise colour, base amplitude, extra filters). These are synthesised noise
+# beds, not recordings — for real chatter or airport chimes, upload a file.
+AMBIENCE_OPTIONS = {
+    "None": None,
+    "🏫 Classroom room tone": ("brown", 0.05, "lowpass=f=500"),
+    "☕ Busy room (soft noise)": ("pink", 0.02, "lowpass=f=1200"),
+    "🌧️ Rain outside": ("pink", 0.035, "bandpass=f=1400:t=h:w=1600"),
+    "✈️ Terminal / hall hum": ("brown", 0.06, "lowpass=f=250,aecho=0.8:0.9:60:0.4"),
+    "📼 Old tape hiss": ("white", 0.006, "highpass=f=3000"),
+    "📁 Upload my own audio…": "upload",
+}
+AMBIENCE_DEFAULT_LEVEL = 4
+
+
+def apply_effect_inplace(path, audio_filter):
+    tmp = path[:-4] + "_fx.mp3"
+    run_ffmpeg([
+        "-i", path, "-af", audio_filter,
+        "-ar", "24000", "-ac", "1", "-acodec", "libmp3lame", "-q:a", "4", tmp
+    ], "applying an audio effect")
+    os.replace(tmp, path)
+
+
+def mix_ambience(speech_path, out_path, choice, level, upload_path=None):
+    """Lay a looping background bed under speech_path, ending with the speech."""
+    factor = level / AMBIENCE_DEFAULT_LEVEL
+    if upload_path:
+        inputs = ["-i", speech_path, "-stream_loop", "-1", "-i", upload_path]
+        bed = (f"[1:a]aresample=24000,aformat=channel_layouts=mono,"
+               f"volume={0.08 * factor:.3f},afade=t=in:d=1.5[amb]")
+    else:
+        colour, amp, extra = AMBIENCE_OPTIONS[choice]
+        inputs = ["-i", speech_path]
+        bed = (f"anoisesrc=color={colour}:r=24000:a={amp * factor:.4f},{extra},"
+               f"afade=t=in:d=1.5[amb]")
+    run_ffmpeg([
+        *inputs,
+        "-filter_complex",
+        f"{bed};[0:a][amb]amix=inputs=2:duration=first:normalize=0[out]",
+        "-map", "[out]", "-ar", "24000", "-ac", "1",
+        "-acodec", "libmp3lame", "-q:a", "4", out_path
+    ], "adding background ambience")
+
+
+def make_beep(tmp_dir):
+    beep_wav = os.path.join(tmp_dir, "beep.wav")
+    beep_mp3 = os.path.join(tmp_dir, "beep.mp3")
+    generate_beep_wav(beep_wav)
+    run_ffmpeg(["-i", beep_wav, "-acodec", "libmp3lame", "-q:a", "4", beep_mp3],
+               "encoding the beep")
+    return beep_mp3
 
 
 def silence_cache(tmp_dir):
@@ -347,329 +500,441 @@ def silence_cache(tmp_dir):
 PREVIEW_TEXT = "The train to the city centre leaves at half past nine."
 
 
-def voice_preview(voice_id, key):
+def voice_preview(voice_id, key, rate=90, pitch=0, container=None):
     """A one-line sample of a voice, so picking between 30 of them is quick."""
+    container = container or st.sidebar
     state_key = f"_preview_{key}"
-    if st.sidebar.button("🔊 Preview voice", key=f"_prevbtn_{key}",
-                         use_container_width=True):
+    if container.button("🔊 Preview voice", key=f"_prevbtn_{key}", width="stretch"):
         d = tempfile.mkdtemp(prefix="lfc_prev_")
         try:
             path = os.path.join(d, "preview.mp3")
-            generate_clips([(PREVIEW_TEXT, voice_id, 90, 0, path)])
+            generate_clips([(PREVIEW_TEXT, voice_id, rate, pitch, path)])
             with open(path, "rb") as f:
-                st.session_state[state_key] = (voice_id, f.read())
+                st.session_state[state_key] = ((voice_id, rate, pitch), f.read())
         except Exception as e:
-            st.sidebar.error(f"Preview failed: {e}")
+            container.error(f"Preview failed: {e}")
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
     cached = st.session_state.get(state_key)
-    # Drop the player if the selection moved on, so it can't play the wrong voice
-    if cached and cached[0] == voice_id:
-        st.sidebar.audio(cached[1], format="audio/mp3")
+    # Drop the player if the settings moved on, so it can't play the wrong thing
+    if cached and cached[0] == (voice_id, rate, pitch):
+        container.audio(cached[1], format="audio/mp3")
+
+
+# ── Presets ───────────────────────────────────────────────────────────────────
+# Preset-controlled widgets read their value from session state (no value=
+# argument), so a preset can rewrite them all in one click.
+DEFAULTS = {
+    "mode": "Single Voice",
+    "use_announcement": True,
+    "announcement_text": "You are going to hear a recording. Listen carefully.",
+    "reading_time_s": 0,
+    "reading_text": "You now have {n} seconds to look at the questions.",
+    "use_beep": True,
+    "pause_after_intro_ms": 1500,
+    "play_twice": False,
+    "repeat_gap_ms": 3000,
+    "repeat_lead_in": "Now listen again.",
+    "closing_text": "",
+    "dictation": False,
+    "dictation_gap_s": 5.0,
+    "dictation_reads": 2,
+}
+for _k, _v in DEFAULTS.items():
+    st.session_state.setdefault(_k, _v)
+
+PRESETS = {
+    "🎓 Cambridge / IELTS part": {
+        "use_announcement": True,
+        "announcement_text": ("Part 1. You will hear a conversation between two people. "
+                              "For questions 1 to 5, choose the correct answer."),
+        "reading_time_s": 30,
+        "reading_text": "You now have {n} seconds to look at questions 1 to 5.",
+        "use_beep": True,
+        "pause_after_intro_ms": 1500,
+        "play_twice": True,
+        "repeat_gap_ms": 5000,
+        "repeat_lead_in": "Now listen again.",
+        "closing_text": "That is the end of Part 1.",
+        "dictation": False,
+    },
+    "✍️ Dictation": {
+        "mode": "Single Voice",
+        "use_announcement": True,
+        "announcement_text": ("Dictation. Listen and write down each sentence. "
+                              "You will hear each sentence twice."),
+        "reading_time_s": 0,
+        "use_beep": True,
+        "pause_after_intro_ms": 1500,
+        "play_twice": False,
+        "closing_text": "That is the end of the dictation.",
+        "dictation": True,
+        "dictation_gap_s": 5.0,
+        "dictation_reads": 2,
+    },
+    "↺ Reset to defaults": DEFAULTS,
+}
+
+
+def _apply_preset():
+    for k, v in PRESETS[st.session_state["preset"]].items():
+        st.session_state[k] = v
 
 
 # ── Sidebar: core settings ────────────────────────────────────────────────────
 st.sidebar.header("Settings")
-mode = st.sidebar.radio("Mode", ["Single Voice", "Dialogue"])
+st.sidebar.selectbox("Exam preset", list(PRESETS), key="preset",
+                     help="Fills in the intro, timing and playback settings below.")
+st.sidebar.button("Apply preset", on_click=_apply_preset, width="stretch")
+
+mode = st.sidebar.radio("Mode", ["Single Voice", "Dialogue"], key="mode")
 filename = st.sidebar.text_input("Output filename", value="listening-activity-1")
 
 if mode == "Single Voice":
     st.sidebar.subheader("Voice")
     voice_label = st.sidebar.selectbox("Voice", voice_list)
     voice_id = VOICES[voice_label]
-    voice_preview(voice_id, "single")
     rate = st.sidebar.slider("Speed (%)", 50, 120, 90, 5,
-                              help="100 = normal. 75–90 recommended for EFL.")
-    pitch = st.sidebar.slider("Pitch (Hz)", -10, 10, 0, 1)
+                             help="100 = normal. 75–90 recommended for EFL.")
+    pitch = st.sidebar.slider("Pitch (Hz)", -20, 20, 0, 1)
+    voice_preview(voice_id, "single", rate, pitch)
+    single_effect = AUDIO_EFFECTS[st.sidebar.selectbox("Audio effect", list(AUDIO_EFFECTS))]
 
+    st.sidebar.subheader("Dictation")
+    dictation = st.sidebar.checkbox(
+        "Dictation mode", key="dictation",
+        help="Reads each sentence, pauses, reads it again, pauses, then moves on.")
+    dictation_gap_s = st.sidebar.slider("Writing time after each reading (s)",
+                                        1.0, 20.0, step=0.5, key="dictation_gap_s",
+                                        disabled=not dictation)
+    dictation_reads = st.sidebar.slider("Times each sentence is read", 1, 3,
+                                        key="dictation_reads", disabled=not dictation)
 else:
+    dictation = False
     st.sidebar.subheader("Dialogue Timing")
     pause_ms = st.sidebar.slider("Pause between turns (ms)", 200, 2000, 600, 100,
-                                  help="500–800ms feels natural.")
-    rate_global = st.sidebar.slider("Speed — all speakers (%)", 50, 120, 90, 5)
-    pitch_global = st.sidebar.slider("Pitch — all speakers (Hz)", -10, 10, 0, 1)
+                                 help="500–800ms feels natural.")
+    st.sidebar.subheader("Speakers")
+    speaker_box = st.sidebar.container()  # filled once the script is parsed
 
 # ── Intro settings ────────────────────────────────────────────────────────────
 st.sidebar.subheader("Intro")
-use_announcement = st.sidebar.checkbox("Add announcement", value=True)
+use_announcement = st.sidebar.checkbox("Add announcement", key="use_announcement")
 announcement_voice_label = st.sidebar.selectbox(
     "Announcement voice", list(ANNOUNCEMENT_VOICES.keys()),
-    disabled=not use_announcement
+    help="Also reads the reading-time instruction, lead-in and closing line."
 )
-if use_announcement:
-    voice_preview(ANNOUNCEMENT_VOICES[announcement_voice_label], "announcement")
+announcement_voice = ANNOUNCEMENT_VOICES[announcement_voice_label]
+voice_preview(announcement_voice, "announcement")
 announcement_text = st.sidebar.text_area(
-    "Announcement text",
-    value="You are going to hear a recording. Listen carefully.",
-    height=80,
+    "Announcement text", height=80, key="announcement_text",
     disabled=not use_announcement
 )
-use_beep = st.sidebar.checkbox("Add beep after announcement", value=True)
+reading_time_s = st.sidebar.slider(
+    "Reading time before audio (s)", 0, 60, step=5, key="reading_time_s",
+    help="Silent time for students to read the questions. 0 = none."
+)
+reading_text = st.sidebar.text_input(
+    "Reading time instruction", key="reading_text",
+    disabled=reading_time_s == 0,
+    help="{n} is replaced with the number of seconds. Leave blank for silence only."
+)
+use_beep = st.sidebar.checkbox("Add tone before the recording", key="use_beep")
 pause_after_intro_ms = st.sidebar.slider(
-    "Pause after intro (ms)", 500, 4000, 1500, 500,
+    "Pause after intro (ms)", 500, 4000, step=500, key="pause_after_intro_ms",
     help="Gap between the intro and the main audio."
 )
 
 # ── Playback ──────────────────────────────────────────────────────────────────
 st.sidebar.subheader("Playback")
 play_twice = st.sidebar.checkbox(
-    "Play passage twice", value=False,
+    "Play passage twice", key="play_twice",
     help="Exam format: the whole passage again after a gap."
 )
 repeat_gap_ms = st.sidebar.slider(
-    "Gap before second play (ms)", 1000, 10000, 3000, 500,
+    "Gap before second play (ms)", 1000, 10000, step=500, key="repeat_gap_ms",
     disabled=not play_twice
 )
 repeat_lead_in = st.sidebar.text_input(
-    "Lead-in to second play", value="Now listen again.",
-    disabled=not play_twice,
+    "Lead-in to second play", key="repeat_lead_in", disabled=not play_twice,
     help="Spoken in the announcement voice. Leave blank for a silent gap."
 )
+closing_text = st.sidebar.text_input(
+    "Closing announcement", key="closing_text",
+    help='e.g. "That is the end of Part 1." Leave blank for none.'
+)
+
+# ── Atmosphere ────────────────────────────────────────────────────────────────
+st.sidebar.subheader("Background ambience")
+ambience_choice = st.sidebar.selectbox(
+    "Ambience", list(AMBIENCE_OPTIONS),
+    help="A quiet background bed under the passage (not under announcements)."
+)
+ambience_level = st.sidebar.slider("Ambience level", 1, 10, AMBIENCE_DEFAULT_LEVEL,
+                                   disabled=ambience_choice == "None")
+ambience_upload = None
+if AMBIENCE_OPTIONS[ambience_choice] == "upload":
+    ambience_upload = st.sidebar.file_uploader(
+        "Background audio (loops)", type=["mp3", "wav", "m4a", "ogg"])
 
 # ── Main area ─────────────────────────────────────────────────────────────────
+PAUSE_HELP = ("Pauses: put `[2s]` (or `[1.5s]`) anywhere in a line to insert a pause "
+              "right there — great for hesitation, dictation chunks or gap-fill.")
+dialogue_speakers, dialogue_lines, speaker_cfg = [], [], {}
+
 if mode == "Single Voice":
-    st.write("Paste your listening passage below and generate a single-voice MP3.")
-    st.caption("Pause control: end any line with `[3s]` to put a 3-second gap after it — handy for dictation and gap-fill.")
+    if dictation:
+        st.write("Paste your dictation text. Each sentence (or line) is read "
+                 f"{dictation_reads}× with {dictation_gap_s:g}s of writing time after each reading.")
+    else:
+        st.write("Paste your listening passage below and generate a single-voice MP3.")
+        st.caption(PAUSE_HELP)
     text_input = st.text_area("Your text",
-                               placeholder="Paste your listening passage here...",
-                               height=240)
+                              placeholder="Paste your listening passage here...",
+                              height=240)
     word_count = len(text_input.split()) if text_input.strip() else 0
-    st.caption(f"{word_count} words · {len(text_input)} characters")
-    detected_speakers = []
-    speaker_voices = {}
+    caption = f"{word_count} words · {len(text_input)} characters"
+    if dictation and text_input.strip():
+        caption += f" · {len(split_sentences(text_input))} dictation sentences"
+    st.caption(caption)
 
 else:
-    st.write("Write your dialogue below. Tag each line with a speaker letter: `A:`, `B:`, `C:`, etc.")
-    st.code("A: Good morning everyone.\nB: Hello! Nice to meet you. [3s]\nC: Hi! Are we starting now?\nA: Yes, let's begin.", language=None)
-    st.caption("Pause control: end any line with `[3s]` to put a 3-second gap after it — handy for dictation and gap-fill.")
+    st.write("Write your dialogue below. Start each line with the speaker's name or "
+             "role and a colon — `A:`, `Emma:`, `Doctor:`, `Shop Assistant:`…")
+    st.code("Interviewer: Good morning. [1s] Please, take a seat.\n"
+            "Candidate: Thank you. It's nice to meet you.\n"
+            "Interviewer: So, tell me a little about yourself. [3s]\n"
+            "Candidate: Well [1s] I studied biology at university.", language=None)
+    st.caption(PAUSE_HELP + " A pause at the end of a line replaces the normal gap "
+               "between turns. Lines without a name continue the previous speaker.")
 
     text_input = st.text_area(
         "Your dialogue",
-        placeholder="A: Good morning!\nB: Hi, how are you?\nC: I'm great, thanks!\nA: Let's get started...",
+        placeholder="Emma: Hi! Are you new here?\nMark: Yes, I started today.",
         height=280
     )
+    dialogue_speakers, dialogue_lines = parse_dialogue(text_input)
 
-    # Detect speakers from current text
-    detected_speakers = []
-    for line in text_input.strip().splitlines():
-        m = re.match(r'^([A-Z])\s*:\s*', line.strip())
-        if m and m.group(1) not in detected_speakers:
-            detected_speakers.append(m.group(1))
-    detected_speakers.sort()
-
-    # Line count preview
-    if detected_speakers:
-        lines = [l.strip() for l in text_input.strip().splitlines() if l.strip()]
-        parsed_preview = []
-        for line in lines:
-            m = re.match(r'^([A-Z])\s*:\s*(.+)', line)
-            if m:
-                parsed_preview.append((m.group(1), m.group(2).strip()))
-        if parsed_preview:
-            counts = {}
-            for spk, _ in parsed_preview:
-                counts[spk] = counts.get(spk, 0) + 1
-            summary = " · ".join(f"{spk}: {n} lines" for spk, n in sorted(counts.items()))
-            st.caption(f"{len(parsed_preview)} lines parsed — {summary}")
+    if dialogue_lines:
+        counts = {}
+        for spk, _ in dialogue_lines:
+            counts[spk] = counts.get(spk, 0) + 1
+        summary = " · ".join(f"{spk}: {n}" for spk, n in counts.items())
+        st.caption(f"{len(dialogue_lines)} lines parsed — {summary}")
     elif text_input.strip():
-        st.info("No speaker tags found. Start lines with A:, B:, C: etc.")
+        st.info("No speaker tags found. Start lines with a name and a colon, e.g. `Emma:`")
 
-    # ── Speaker voice selectors — always in sidebar so values persist ──
-    speaker_voices = {}
-    if detected_speakers:
-        st.sidebar.subheader("Speaker Voices")
-        for i, spk in enumerate(detected_speakers):
+    # ── Per-speaker voice, speed, pitch and effect ──
+    if not dialogue_speakers:
+        speaker_box.caption("Speakers appear here once your script has name tags.")
+    for i, spk in enumerate(dialogue_speakers):
+        k = safe_key(spk)
+        with speaker_box.expander(f"🗣️ {spk}", expanded=i < 2):
             default_id = DEFAULT_SPEAKER_VOICES[i % len(DEFAULT_SPEAKER_VOICES)]
-            default_idx = _voice_ids.index(default_id)
-            label = st.sidebar.selectbox(
-                f"Speaker {spk}",
-                voice_list,
-                index=default_idx,
-                key=f"voice_{spk}"
-            )
-            speaker_voices[spk] = VOICES[label]
-            voice_preview(speaker_voices[spk], f"spk_{spk}")
-    else:
-        # Still need to read any previously set sidebar widgets so state is consistent
-        for spk in "ABCDEF":
-            key = f"voice_{spk}"
-            if key in st.session_state:
-                speaker_voices[spk] = VOICES[st.session_state[key]]
+            label = st.selectbox("Voice", voice_list,
+                                 index=_voice_ids.index(default_id), key=f"voice_{k}")
+            spk_rate = st.slider("Speed (%)", 50, 120, 90, 5, key=f"rate_{k}")
+            spk_pitch = st.slider("Pitch (Hz)", -20, 20, 0, 1, key=f"pitch_{k}",
+                                  help="Lower for an older/deeper voice, higher for a younger one.")
+            spk_fx = st.selectbox("Audio effect", list(AUDIO_EFFECTS), key=f"fx_{k}",
+                                  help="e.g. Telephone for the caller in a phone conversation.")
+            voice_preview(VOICES[label], f"spk_{k}", spk_rate, spk_pitch, container=st)
+        speaker_cfg[spk] = {"voice": VOICES[label], "rate": spk_rate,
+                            "pitch": spk_pitch, "fx": AUDIO_EFFECTS[spk_fx]}
 
-# ── Intro builder ─────────────────────────────────────────────────────────────
-def build_intro_segments(tmp_dir):
-    segments = []
+
+# ── Build plan ────────────────────────────────────────────────────────────────
+# Each plan_* function appends TTS jobs to `jobs` and returns the segment list.
+# All jobs are then synthesised together, in parallel, before stitching.
+def plan_intro(tmp_dir, get_silence, jobs):
+    segs = []
     if use_announcement and announcement_text.strip():
-        ann_path = os.path.join(tmp_dir, "announcement.mp3")
-        asyncio.run(generate_clip(
-            announcement_text.strip(),
-            ANNOUNCEMENT_VOICES[announcement_voice_label],
-            90, 0, ann_path
-        ))
-        segments.append(ann_path)
-        ann_pause_path = os.path.join(tmp_dir, "ann_pause.mp3")
-        generate_silence_mp3(ann_pause_path, 600)
-        segments.append(ann_pause_path)
-
+        p = os.path.join(tmp_dir, "announcement.mp3")
+        jobs.append((announcement_text.strip(), announcement_voice, 90, 0, p))
+        segs += [p, get_silence(600)]
+    if reading_time_s > 0:
+        txt = reading_text.replace("{n}", str(reading_time_s)).strip()
+        if txt:
+            p = os.path.join(tmp_dir, "reading_time.mp3")
+            jobs.append((txt, announcement_voice, 90, 0, p))
+            segs.append(p)
+        segs.append(get_silence(reading_time_s * 1000))
     if use_beep:
-        beep_wav = os.path.join(tmp_dir, "beep.wav")
-        beep_mp3 = os.path.join(tmp_dir, "beep.mp3")
-        generate_beep_wav(beep_wav)
-        run_ffmpeg([
-            "-i", beep_wav,
-            "-acodec", "libmp3lame", "-q:a", "4", beep_mp3
-        ], "encoding the beep")
-        segments.append(beep_mp3)
-
-    if segments:
-        pause_path = os.path.join(tmp_dir, "intro_pause.mp3")
-        generate_silence_mp3(pause_path, pause_after_intro_ms)
-        segments.append(pause_path)
-
-    return segments
-
-
-def build_repeat_segments(tmp_dir, body_segments, get_silence):
-    """Gap, optional spoken lead-in, then the whole passage again."""
-    segs = [get_silence(repeat_gap_ms)]
-    if repeat_lead_in.strip():
-        lead_path = os.path.join(tmp_dir, "repeat_lead_in.mp3")
-        generate_clips([(
-            repeat_lead_in.strip(),
-            ANNOUNCEMENT_VOICES[announcement_voice_label],
-            90, 0, lead_path
-        )])
-        segs.append(lead_path)
-        segs.append(get_silence(1000))
-    segs.extend(body_segments)
+        segs.append(make_beep(tmp_dir))
+    if segs:
+        segs.append(get_silence(pause_after_intro_ms))
     return segs
 
+
+def plan_extras(tmp_dir, jobs):
+    """Second-play lead-in and closing line, read in the announcement voice."""
+    extras = {"lead_in": None, "closing": None}
+    if play_twice and repeat_lead_in.strip():
+        extras["lead_in"] = os.path.join(tmp_dir, "repeat_lead_in.mp3")
+        jobs.append((repeat_lead_in.strip(), announcement_voice, 90, 0, extras["lead_in"]))
+    if closing_text.strip():
+        extras["closing"] = os.path.join(tmp_dir, "closing.mp3")
+        jobs.append((closing_text.strip(), announcement_voice, 90, 0, extras["closing"]))
+    return extras
+
+
+def assemble_outro(body, extras, get_silence):
+    segs = []
+    if play_twice:
+        segs.append(get_silence(repeat_gap_ms))
+        if extras["lead_in"]:
+            segs += [extras["lead_in"], get_silence(1000)]
+        segs.extend(body)
+    if extras["closing"]:
+        segs += [get_silence(1500), extras["closing"]]
+    return segs
+
+
+def plan_single(tmp_dir, get_silence, jobs, fx):
+    body = []
+
+    def clip(name, text):
+        p = os.path.join(tmp_dir, name)
+        jobs.append((text, voice_id, rate, pitch, p))
+        if single_effect:
+            fx[p] = single_effect
+        return p
+
+    if dictation:
+        gap = get_silence(int(dictation_gap_s * 1000))
+        for i, sentence in enumerate(split_sentences(text_input)):
+            p = clip(f"sentence_{i}.mp3", sentence)
+            body += [p, gap] * dictation_reads
+        return body
+
+    for i, (chunk, pause) in enumerate(split_passage(text_input)):
+        if chunk:
+            body.append(clip(f"part_{i}.mp3", chunk))
+        if pause:
+            body.append(get_silence(pause))
+    return body
+
+
+def plan_dialogue(tmp_dir, get_silence, jobs, fx):
+    body, n = [], 0
+    for li, (spk, chunks) in enumerate(dialogue_lines):
+        cfg = speaker_cfg[spk]
+        for chunk, pause in chunks:
+            if chunk:
+                p = os.path.join(tmp_dir, f"line_{n}.mp3")
+                n += 1
+                jobs.append((chunk, cfg["voice"], cfg["rate"], cfg["pitch"], p))
+                if cfg["fx"]:
+                    fx[p] = cfg["fx"]
+                body.append(p)
+            if pause:
+                body.append(get_silence(pause))
+        # A trailing [Ns] marker already supplied this line's gap
+        if li < len(dialogue_lines) - 1 and chunks[-1][1] == 0:
+            body.append(get_silence(pause_ms))
+    return body
+
+
+def build_audio(tmp_dir, progress):
+    get_silence = silence_cache(tmp_dir)
+    jobs, fx = [], {}
+    intro = plan_intro(tmp_dir, get_silence, jobs)
+    extras = plan_extras(tmp_dir, jobs)
+    if mode == "Single Voice":
+        body = plan_single(tmp_dir, get_silence, jobs, fx)
+    else:
+        body = plan_dialogue(tmp_dir, get_silence, jobs, fx)
+    if not body:
+        raise ValueError("There's nothing to read — check your text.")
+
+    total = len(jobs)
+    generate_clips(jobs, on_progress=lambda n: progress.progress(
+        n / total, text=f"Generating voices… {n} of {total}"))
+
+    if fx:
+        progress.progress(1.0, text="Applying audio effects…")
+        for path, audio_filter in fx.items():
+            apply_effect_inplace(path, audio_filter)
+
+    if AMBIENCE_OPTIONS[ambience_choice] is not None:
+        upload_path = None
+        if AMBIENCE_OPTIONS[ambience_choice] == "upload":
+            if ambience_upload is None:
+                raise ValueError("Upload a background audio file, or pick a different ambience.")
+            ext = os.path.splitext(ambience_upload.name)[1] or ".mp3"
+            upload_path = os.path.join(tmp_dir, f"ambience_upload{ext}")
+            with open(upload_path, "wb") as f:
+                f.write(ambience_upload.getvalue())
+        progress.progress(1.0, text="Adding background ambience…")
+        raw = os.path.join(tmp_dir, "body_raw.mp3")
+        mixed = os.path.join(tmp_dir, "body_ambience.mp3")
+        stitch_clips(body, raw)
+        mix_ambience(raw, mixed, ambience_choice, ambience_level, upload_path)
+        body = [mixed]
+
+    all_segments = intro + body + assemble_outro(body, extras, get_silence)
+    progress.progress(1.0, text="Joining everything together…")
+    out_path = os.path.join(tmp_dir, "output.mp3")
+    if len(all_segments) == 1:
+        out_path = all_segments[0]
+    else:
+        stitch_clips(all_segments, out_path)
+    with open(out_path, "rb") as f:
+        return f.read()
+
+
+def show_transcript():
+    with st.expander("📄 View transcript"):
+        if use_announcement and announcement_text.strip():
+            st.markdown(f"*📢 {announcement_text.strip()}*")
+        if reading_time_s > 0 and reading_text.strip():
+            st.markdown(f"*📢 {reading_text.replace('{n}', str(reading_time_s))}*")
+        st.markdown("---")
+        if mode == "Dialogue":
+            for spk, chunks in dialogue_lines:
+                text = " … ".join(c for c, _ in chunks if c)
+                st.markdown(f"**{spk}:** {text}")
+        elif dictation:
+            for i, s in enumerate(split_sentences(text_input), 1):
+                st.markdown(f"{i}. {s}")
+        else:
+            st.markdown(strip_pause_markers(text_input).replace("\n", "  \n"))
+        if closing_text.strip():
+            st.markdown("---")
+            st.markdown(f"*📢 {closing_text.strip()}*")
+
+
 # ── Generate ──────────────────────────────────────────────────────────────────
-if st.button("⏺ Generate MP3", type="primary", use_container_width=True):
+if st.button("⏺ Generate MP3", type="primary", width="stretch"):
     if not text_input.strip():
         st.warning("Please enter some text first.")
-
-    elif mode == "Single Voice":
+    elif mode == "Dialogue" and not dialogue_lines:
+        st.warning("No speaker tags found. Start lines with a name and a colon, e.g. `Emma:`")
+    else:
         with st.spinner("Generating audio..."):
             tmp_dir = tempfile.mkdtemp(prefix="lfc_")
+            progress = st.progress(0, text="Preparing…")
             try:
-                get_silence = silence_cache(tmp_dir)
-                all_segments = build_intro_segments(tmp_dir)
-
-                chunks = split_passage(text_input)
-                jobs, body = [], []
-                for i, (chunk, pause) in enumerate(chunks):
-                    part_path = os.path.join(tmp_dir, f"part_{i}.mp3")
-                    jobs.append((chunk, voice_id, rate, pitch, part_path))
-                    body.append(part_path)
-                    if pause:
-                        body.append(get_silence(pause))
-
-                progress = st.progress(0, text="Generating audio...")
-                generate_clips(jobs, on_progress=lambda n: progress.progress(
-                    n / len(jobs), text=f"{n} of {len(jobs)} parts..."
-                ))
-
-                all_segments.extend(body)
-                if play_twice:
-                    all_segments.extend(build_repeat_segments(tmp_dir, body, get_silence))
-
-                out_path = os.path.join(tmp_dir, "output.mp3")
-                if len(all_segments) == 1:
-                    out_path = all_segments[0]
-                else:
-                    stitch_clips(all_segments, out_path)
-                with open(out_path, "rb") as f:
-                    audio_bytes = f.read()
+                audio_bytes = build_audio(tmp_dir, progress)
+                progress.empty()
                 st.audio(audio_bytes, format="audio/mp3")
+                default_name = "dialogue" if mode == "Dialogue" else "listening-audio"
                 st.download_button(
                     "⬇ Download MP3", data=audio_bytes,
-                    file_name=f"{filename.strip() or 'listening-audio'}.mp3",
-                    mime="audio/mp3", use_container_width=True
+                    file_name=f"{filename.strip() or default_name}.mp3",
+                    mime="audio/mp3", width="stretch"
                 )
-                st.success("Done!")
+                if mode == "Dialogue":
+                    st.success(f"Done! {len(dialogue_lines)}-line dialogue generated.")
+                else:
+                    st.success("Done!")
+                show_transcript()
             except Exception as e:
+                progress.empty()
                 st.error(f"Something went wrong: {e}")
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    else:  # Dialogue mode
-        if not detected_speakers:
-            st.warning("No speaker tags found. Start lines with A:, B:, C: etc.")
-        elif not speaker_voices:
-            st.warning("Speaker voices not set. Please add your script first so voices appear in the sidebar.")
-        else:
-            lines = [l.strip() for l in text_input.strip().splitlines() if l.strip()]
-            parsed = []
-            for line in lines:
-                m = re.match(r'^([A-Z])\s*:\s*(.+)', line)
-                if m and m.group(1) in speaker_voices:
-                    body_text, pause_override = strip_pause_marker(m.group(2))
-                    if body_text:
-                        parsed.append((m.group(1), body_text, pause_override))
-
-            if not parsed:
-                st.warning("No valid tagged lines found. Check your format.")
-            else:
-                with st.spinner(f"Generating {len(parsed)} lines of dialogue..."):
-                    tmp_dir = tempfile.mkdtemp(prefix="lfc_")
-                    try:
-                        get_silence = silence_cache(tmp_dir)
-                        all_segments = build_intro_segments(tmp_dir)
-
-                        progress = st.progress(0, text="Generating voices...")
-                        dialogue_clips = [
-                            os.path.join(tmp_dir, f"line_{i}.mp3")
-                            for i in range(len(parsed))
-                        ]
-                        jobs = [
-                            (text, speaker_voices[spk], rate_global, pitch_global, path)
-                            for (spk, text, _), path in zip(parsed, dialogue_clips)
-                        ]
-                        generate_clips(jobs, on_progress=lambda n: progress.progress(
-                            n / len(jobs), text=f"{n} of {len(jobs)} lines..."
-                        ))
-
-                        body = []
-                        for i, clip in enumerate(dialogue_clips):
-                            body.append(clip)
-                            if i < len(dialogue_clips) - 1:
-                                override = parsed[i][2]
-                                body.append(get_silence(override or pause_ms))
-                        all_segments.extend(body)
-                        if play_twice:
-                            all_segments.extend(
-                                build_repeat_segments(tmp_dir, body, get_silence)
-                            )
-
-                        out_path = os.path.join(tmp_dir, "output.mp3")
-                        stitch_clips(all_segments, out_path)
-
-                        with open(out_path, "rb") as f:
-                            audio_bytes = f.read()
-
-                        st.audio(audio_bytes, format="audio/mp3")
-                        st.download_button(
-                            "⬇ Download MP3", data=audio_bytes,
-                            file_name=f"{filename.strip() or 'dialogue'}.mp3",
-                            mime="audio/mp3", use_container_width=True
-                        )
-                        st.success(f"Done! {len(parsed)}-line dialogue generated.")
-
-                        with st.expander("📄 View transcript"):
-                            if use_announcement and announcement_text.strip():
-                                st.markdown(f"*📢 {announcement_text.strip()}*")
-                                st.markdown("---")
-                            for spk, text, _ in parsed:
-                                voice_name = [k for k, v in VOICES.items() if v == speaker_voices[spk]]
-                                name = voice_name[0].split("(")[1].split(")")[0] if voice_name else spk
-                                st.markdown(f"**{spk} — {name}:** {text}")
-
-                    except Exception as e:
-                        st.error(f"Something went wrong: {e}")
-                    finally:
-                        shutil.rmtree(tmp_dir, ignore_errors=True)
-
 st.divider()
-st.caption("Built with Streamlit + Microsoft Edge TTS · Single voice & multi-speaker dialogue")
+st.caption("Built with Streamlit + Microsoft Edge TTS · Single voice, dialogue, dictation & exam presets")
