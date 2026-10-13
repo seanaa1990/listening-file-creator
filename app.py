@@ -8,6 +8,110 @@ import re
 import struct
 import math
 import shutil
+import hashlib
+from typing import List, Tuple, Optional
+
+
+def _patch_edge_tts_for_v2():
+    """Workaround for Microsoft's October 2026 Sec-MS-GEC v2 requirement.
+    Fixes WSServerHandshakeError: 403 in edge-tts <= 7.2.8.
+    Automatically no-ops if a future edge-tts release already uses v2.
+    """
+    import edge_tts
+    if not getattr(edge_tts.constants, "SEC_MS_GEC_VERSION", "").startswith("1-"):
+        return
+
+    from edge_tts.constants import TRUSTED_CLIENT_TOKEN, CHROMIUM_FULL_VERSION
+    from edge_tts.drm import DRM, WIN_EPOCH, S_TO_NS
+
+    PATENT_HASH_PREFIX = b"Copyright (C) Microsoft Corporation. All rights reserved."
+    _u32_mask = 0xFFFFFFFF
+
+    def _u32(value: int) -> int:
+        return value & _u32_mask
+
+    def _rol16(value: int) -> int:
+        value &= _u32_mask
+        return ((value << 16) | (value >> 16)) & _u32_mask
+
+    def _words_le4_even(data: bytes) -> List[int]:
+        padded = data + b"\x00" * ((-len(data)) % 4)
+        if not padded:
+            return []
+        words = list(struct.unpack(f"<{len(padded) // 4}I", padded))
+        if len(words) % 2:
+            words.append(0)
+        return words
+
+    def _cs64_word_swap(words: List[int], key_words: List[int]) -> Tuple[int, int]:
+        if len(words) < 2 or len(words) % 2 or len(key_words) < 2:
+            raise ValueError("CS64 requires nonempty even-sized data and 2 key words")
+        a, b = key_words[0] | 1, key_words[1] | 1
+        acc = 0
+        last = 0
+        for x, y in zip(words[0::2], words[1::2]):
+            t = _u32(_rol16(x) * 0xEF0569FB + x * a)
+            t = _rol16(t)
+            q = _u32(t * 0x76F50F34)
+            q = _u32(_rol16(q) * 0xC3EFEA97 + q)
+            acc = _u32(acc + q)
+
+            t = _u32(_rol16(y) * 0xC31713DB + y * b)
+            t = _rol16(t)
+            q = _u32(t * 0x1881CE3C)
+            last = _u32(_rol16(q) * 0x35BD1EC9 + q)
+            acc = _u32(acc + last)
+        return last, acc
+
+    def _cs64_reversible(words: List[int], key_words: List[int]) -> Tuple[int, int]:
+        if len(words) < 2 or len(words) % 2 or len(key_words) < 2:
+            raise ValueError("CS64 requires nonempty even-sized data and 2 key words")
+        a, b = key_words[0] | 1, key_words[1] | 1
+        state = acc = 0
+        for x, y in zip(words[0::2], words[1::2]):
+            state = _u32((state + x) * a)
+            for const in (0xCF98B111, 0x87085B9F, 0x12CEB96D, 0x257E1D83):
+                state = _u32(_rol16(state) * const)
+            t = _u32((y + state) * b)
+            t = _u32(_rol16(t) * 0xA27416F5)
+            t = _u32(_rol16(t) * 0xD38396FF)
+            t = _rol16(t)
+            acc = _u32(acc + state)
+            state = _u32(_rol16(_u32(t * 0x7C932B89)) * 0xBFA49F69)
+            acc = _u32(acc + state)
+        return state, acc
+
+    def _patent_hash(data: bytes) -> Tuple[str, str]:
+        digest = hashlib.sha256(data).digest()
+        data_words = _words_le4_even(data)
+        digest_words = _words_le4_even(digest)
+        a = _cs64_word_swap(data_words, digest_words)
+        b = _cs64_reversible(data_words, digest_words)
+        cs64 = struct.pack("<II", a[0] ^ b[0], a[1] ^ b[1]).hex().upper()
+        return cs64, digest.hex().upper()
+
+    def generate_sec_ms_gec_v2(unix_timestamp: Optional[float] = None) -> str:
+        if unix_timestamp is None:
+            ticks = DRM.get_unix_timestamp()
+        else:
+            ticks = float(unix_timestamp)
+        ticks += WIN_EPOCH
+        ticks -= ticks % 300
+        ticks *= S_TO_NS / 100
+        str_to_hash = f"{ticks:.0f}{TRUSTED_CLIENT_TOKEN}".encode("ascii")
+        cs64, sha256 = _patent_hash(PATENT_HASH_PREFIX + str_to_hash)
+        return f"{cs64}-{sha256}"
+
+    v2_version = f"2-{CHROMIUM_FULL_VERSION}"
+    edge_tts.constants.SEC_MS_GEC_VERSION = v2_version
+    import edge_tts.communicate
+    edge_tts.communicate.SEC_MS_GEC_VERSION = v2_version
+    import edge_tts.voices
+    edge_tts.voices.SEC_MS_GEC_VERSION = v2_version
+    edge_tts.drm.DRM.generate_sec_ms_gec = staticmethod(generate_sec_ms_gec_v2)
+
+
+_patch_edge_tts_for_v2()
 
 
 def _resolve_ffmpeg():
